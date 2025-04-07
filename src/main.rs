@@ -16,7 +16,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{broadcast, mpsc, RwLock};
-use futures::stream::FuturesUnordered;
 use tokio::task::JoinHandle;
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
@@ -378,7 +377,7 @@ async fn connect_plc(args: Arc<Args>, table: Table, plc_addr: SocketAddr) -> Res
 
     // add extra route
     if let Some(ams_net_id) = args.route_ams_net_id {
-        let route_host = args.route_host.clone().unwrap_or(plc_addr.ip().to_string());
+        let route_host = args.route_host.clone().unwrap_or(host_addr.ip().to_string());
         log::info!("add route {} host {} to plc", ams_net_id, route_host);
         ads::udp::add_route(
             (&plc_addr.ip().to_string(), ads::UDP_PORT),
@@ -492,10 +491,8 @@ async fn main() -> Result<()> {
         })
         .collect();
 
-    // spawn the accept_client task
     let accept_task = tokio::spawn(accept_client(args.clone(), proxy_table.clone()));
 
-    // run select! to wait for either task group
     let e = tokio::select! {
         r = accept_task => r,
         r = async {
