@@ -11,10 +11,13 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::BytesMut;
 use clap::Parser;
 use env_logger::Env;
+use futures::future::select_all;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{broadcast, mpsc, RwLock};
+use futures::stream::FuturesUnordered;
+use tokio::task::JoinHandle;
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub struct AmsNetId(pub [u8; 6]);
@@ -233,7 +236,7 @@ struct Args {
     pub listen_addr: SocketAddr,
 
     /// PLC address, e.g. 172.18.0.10:48898
-    pub plc_addr: SocketAddr,
+    pub plc_addr: Vec<SocketAddr>,
 }
 
 async fn read_ams_packet<T>(reader: &mut T, buf: &mut BytesMut, packet_size: usize) -> Result<usize>
@@ -358,9 +361,9 @@ where
     result
 }
 
-async fn connect_plc(args: Arc<Args>, table: Table) -> Result<()> {
+async fn connect_plc(args: Arc<Args>, table: Table, plc_addr: SocketAddr) -> Result<()> {
     // detect plc info
-    let plc_info = ads::udp::get_info((&args.plc_addr.ip().to_string(), ads::UDP_PORT))?;
+    let plc_info = ads::udp::get_info((&plc_addr.ip().to_string(), ads::UDP_PORT))?;
     log::info!("plc net_id={}", plc_info.netid);
     log::info!("plc hostname={}", plc_info.hostname);
     log::info!("plc twincat_version={:?}", plc_info.twincat_version);
@@ -368,14 +371,14 @@ async fn connect_plc(args: Arc<Args>, table: Table) -> Result<()> {
     log::info!("plc fingerprint={}", plc_info.fingerprint);
 
     // connect plc backend
-    log::info!("connecting plc {}...", args.plc_addr);
-    let mut plc_client = TcpStream::connect(args.plc_addr).await?;
+    log::info!("connecting plc {}...", plc_addr);
+    let mut plc_client = TcpStream::connect(plc_addr).await?;
     let plc_addr = plc_client.peer_addr()?;
     let host_addr = plc_client.local_addr()?;
 
     // add extra route
     if let Some(ams_net_id) = args.route_ams_net_id {
-        let route_host = args.route_host.clone().unwrap_or(host_addr.ip().to_string());
+        let route_host = args.route_host.clone().unwrap_or(plc_addr.ip().to_string());
         log::info!("add route {} host {} to plc", ams_net_id, route_host);
         ads::udp::add_route(
             (&plc_addr.ip().to_string(), ads::UDP_PORT),
@@ -389,7 +392,7 @@ async fn connect_plc(args: Arc<Args>, table: Table) -> Result<()> {
 
         // reconnect plc
         plc_client.shutdown().await?;
-        plc_client = TcpStream::connect(args.plc_addr).await?;
+        plc_client = TcpStream::connect(plc_addr).await?;
     }
 
     // prepare queues
@@ -476,12 +479,29 @@ async fn main() -> Result<()> {
     // global proxy tables and stop event
     let proxy_table: Table = Arc::new(RwLock::new(HashMap::new()));
 
-    let plc_task = connect_plc(args.clone(), proxy_table.clone());
-    let accept_task = accept_client(args.clone(), proxy_table.clone());
+    let plc_tasks: Vec<JoinHandle<anyhow::Result<()>>> = args
+        .plc_addr
+        .iter()
+        .cloned()
+        .map(|addr| {
+            let args = args.clone();
+            let proxy_table = proxy_table.clone();
+            tokio::spawn(async move {
+                connect_plc(args, proxy_table, addr).await
+            })
+        })
+        .collect();
 
-    let e = select! {
-        r = tokio::spawn(plc_task) => r,
-        r = tokio::spawn(accept_task) => r,
+    // spawn the accept_client task
+    let accept_task = tokio::spawn(accept_client(args.clone(), proxy_table.clone()));
+
+    // run select! to wait for either task group
+    let e = tokio::select! {
+        r = accept_task => r,
+        r = async {
+            let (res, _idx, _remaining) = select_all(plc_tasks).await;
+            res
+        } => r,
     };
     log::error!("ads-proxy error: {:?}", e);
     log::warn!("ads-proxy stopped");
