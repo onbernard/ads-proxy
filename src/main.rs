@@ -5,8 +5,9 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::env;
 
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::BytesMut;
 use clap::Parser;
@@ -235,6 +236,7 @@ struct Args {
     pub listen_addr: SocketAddr,
 
     /// PLC address, e.g. 172.18.0.10:48898
+    #[arg(num_args = 0.., value_parser = clap::value_parser!(SocketAddr))]
     pub plc_addr: Vec<SocketAddr>,
 }
 
@@ -469,7 +471,14 @@ async fn accept_client(args: Arc<Args>, table: Table) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Arc::new(Args::parse());
+    let mut args = Args::parse();
+
+    let plc_addrs_env = env::var("PLC_ADDR");
+    args.plc_addr.extend(plc_addrs_env.unwrap_or("".to_string()).split(" ").filter_map(|s| s.parse::<SocketAddr>().ok()).collect::<Vec<SocketAddr>>());
+    if args.plc_addr.len()==0 {
+        bail!("At least one plc_addr must be provided");
+    }
+    let args = Arc::new(args);
 
     // init logging
     let log_level = if args.debug { "debug" } else { "info" };
